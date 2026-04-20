@@ -10,7 +10,7 @@ namespace Config {
 
     // ── 输入文件 ──────────────────────────────────
     const std::string DATA_DIR = std::string(PROJECT_ROOT) + "/data/";
-    const std::string PBF_INPUT_PATH = DATA_DIR + "stuttgart-regbez-260414.osm.pbf";
+    const std::string PATH_STUTTGART_PBF = DATA_DIR + "stuttgart-regbez-260414.osm.pbf";
 
     // ── 输出文件 ──────────────────────────────────
     const std::string HOUSES_BIN = DATA_DIR + "houses.bin";

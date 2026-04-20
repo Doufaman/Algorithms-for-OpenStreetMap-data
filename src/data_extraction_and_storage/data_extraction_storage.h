@@ -1,7 +1,9 @@
 #pragma once
 #include <string>
 
-// 声明函数，其他文件 include 此头文件后即可调用
-namespace DataExtraction {
+// DES = Data Extraction and Storage
+// read, process and store data from OSM PBF files
+namespace DES {
     void extractFromPBF(const std::string& pbf_path);
 }
+
