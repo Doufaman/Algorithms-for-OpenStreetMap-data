@@ -32,4 +32,12 @@ Put the downloaded PBF file in the "data" folder. Then modify file paths in "con
 |-- config.h<br>
 
 ### 3. Run
-Run main.cpp<br>
+Run main.cpp and follow the instruction.<br>
+Run 
+
+    "/home/dfm/.vs/<your file>/out/build/linux-debug/OSM_Geocoder" serve
+
+    or
+
+    cd "/home/dfm/.vs/<your file>/out/build/linux-debug"
+    ./OSM_Geocoder serve

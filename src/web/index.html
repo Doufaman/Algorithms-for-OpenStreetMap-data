@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>OSM Geocoder</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+
+<!-- ── Header ─────────────────────────────────── -->
+<header id="app-header">
+  <div class="header-left">
+    <span class="logo-mark">◈</span>
+    <span class="logo-text">OSM<em>Geocoder</em></span>
+  </div>
+  <div class="header-right">
+    <div class="stat-chip" id="stat-points">
+      <span class="stat-label">POINTS</span>
+      <span class="stat-val" id="val-points">—</span>
+    </div>
+    <div class="stat-chip" id="stat-lines">
+      <span class="stat-label">LINES</span>
+      <span class="stat-val" id="val-lines">—</span>
+    </div>
+    <div class="stat-chip" id="stat-admin">
+      <span class="stat-label">ADMIN</span>
+      <span class="stat-val" id="val-admin">—</span>
+    </div>
+  </div>
+</header>
+
+<!-- ── Map ────────────────────────────────────── -->
+<div id="map"></div>
+
+<!-- ── Layer toggles ──────────────────────────── -->
+<div id="layer-panel">
+  <div class="panel-title">LAYERS</div>
+  <label class="toggle-row" id="tog-points">
+    <span class="toggle-dot" style="background:var(--c-point)"></span>
+    <span class="toggle-label">Buildings &amp; POI</span>
+    <input type="checkbox" checked id="cb-points"/>
+    <span class="toggle-switch"></span>
+  </label>
+  <label class="toggle-row" id="tog-lines">
+    <span class="toggle-dot" style="background:var(--c-line)"></span>
+    <span class="toggle-label">Roads</span>
+    <input type="checkbox" checked id="cb-lines"/>
+    <span class="toggle-switch"></span>
+  </label>
+  <label class="toggle-row" id="tog-admin">
+    <span class="toggle-dot" style="background:var(--c-admin)"></span>
+    <span class="toggle-label">Admin Areas</span>
+    <input type="checkbox" id="cb-admin"/>
+    <span class="toggle-switch"></span>
+  </label>
+  <div class="limit-row">
+    <span class="toggle-label">Max features</span>
+    <select id="sel-limit">
+      <option value="200">200</option>
+      <option value="500">500</option>
+      <option value="1000" selected>1 000</option>
+      <option value="2000">2 000</option>
+    </select>
+  </div>
+</div>
+
+<!-- ── Info popup ─────────────────────────────── -->
+<div id="info-popup" class="hidden">
+  <button id="info-close">✕</button>
+  <div id="info-content"></div>
+</div>
+
+<!-- ── Status bar ─────────────────────────────── -->
+<div id="status-bar">
+  <span id="status-text">Initialising …</span>
+  <span id="zoom-display"></span>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="map.js"></script>
+</body>
+</html>
