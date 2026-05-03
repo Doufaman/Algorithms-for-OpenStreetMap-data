@@ -365,6 +365,5 @@ FodyWeavers.xsd
 .vs/
 out/
 build/
-data/
-*.pbf
 *.bin
+data/

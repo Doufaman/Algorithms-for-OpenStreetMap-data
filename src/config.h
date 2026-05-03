@@ -5,12 +5,10 @@
 
 namespace Config {
 
-    // CMAKE_SOURCE_DIR 对应项目根目录，在编译时由 CMake 传入
-    // 运行时用相对路径或绝对路径
-
     // input
     const std::string DATA_DIR = std::string(PROJECT_ROOT) + "/data/"; //data file
     const std::string PATH_STUTTGART_PBF = DATA_DIR + "stuttgart-regbez-260414.osm.pbf";
+	const std::string PATH_BADEN_WUERTTEMBERG_PBF = DATA_DIR + "baden-wuerttemberg-latest.osm.pbf";
 
     // output
     const std::string SAMPLE_DATA_DIR = "/mnt/c/myfiles/stuttgart/OSM/code/Algorithms for OSM/Algorithms for OSM/data/";
