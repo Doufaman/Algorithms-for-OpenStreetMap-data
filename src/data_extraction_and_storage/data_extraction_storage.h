@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 #include <cstddef>
 
@@ -74,6 +75,14 @@ namespace DES {
         uint32_t street_off = StringPool::NONE;
         uint32_t housenumber_off = StringPool::NONE;
         uint32_t postcode_off = StringPool::NONE;
+
+        // Admin chain (Sheet 2 Task 2). Filled by geo::attach_admin_to_db
+        // after PIP hierarchy is built. All are StringPool offsets.
+        uint32_t country_off = StringPool::NONE;   // tier COUNTRY
+        uint32_t state_off   = StringPool::NONE;   // tier STATE
+        uint32_t city_off    = StringPool::NONE;   // tier CITY
+        uint32_t suburb_off  = StringPool::NONE;   // tier SUBURB (deepest)
+
         std::vector<Tag> extra_tags;
     };
 
@@ -180,6 +189,11 @@ namespace DES {
         // Raw relations are kept until processing resolves them
         std::vector<RawRelation> raw_relations;
 
+        // Way IDs referenced by boundary-admin relations.
+        // Populated by the pre-scan pass; used in Pass 2 to ensure
+        // tagless boundary segment ways still get their geometry cached.
+        std::unordered_set<int64_t> needed_way_ids;
+
         // Final semantic output
         std::vector<Point>     points;
         std::vector<Line>      lines;
@@ -205,10 +219,13 @@ namespace DES {
         size_t admin_bytes = 0;
         size_t string_pool_bytes = 0;
 
+        double prescan_ms = 0;
         double pass1_ms = 0;
         double pass2_ms = 0;
         double processing_ms = 0;
         double storage_ms = 0;
+
+        size_t needed_way_ids_count = 0;
     };
 
     // ------------------------------------------------------------

@@ -1,4 +1,6 @@
 #include "data_extraction_storage.h"
+#include "io/binary_io.h"
+#include "config.h"
 
 #include <iostream>
 #include <fstream>
@@ -164,9 +166,36 @@ namespace DES {
             else if (!strcmp(k, "addr:street"))      p.street_off = t.val_off;
             else if (!strcmp(k, "addr:housenumber")) p.housenumber_off = t.val_off;
             else if (!strcmp(k, "addr:postcode"))    p.postcode_off = t.val_off;
+            // OSM may carry explicit address tags — when present these are
+            // more reliable than PIP-derived admin attribution.
+            else if (!strcmp(k, "addr:country"))     p.country_off = t.val_off;
+            else if (!strcmp(k, "addr:state"))       p.state_off   = t.val_off;
+            else if (!strcmp(k, "addr:city"))        p.city_off    = t.val_off;
+            else if (!strcmp(k, "addr:suburb"))      p.suburb_off  = t.val_off;
             else p.extra_tags.push_back(t);
         }
     }
+
+    // ============================================================
+    //  PASS 0 HANDLER – Relation pre-scan
+    //  Collects IDs of all ways that are members of admin-boundary
+    //  relations. These IDs are read again in Pass 2 to force their
+    //  geometry into the cache even when they carry no tags of their
+    //  own — without this step admin polygons cannot be assembled.
+    // ============================================================
+    struct RelationPrescanHandler : public osmium::handler::Handler {
+        OsmData& db;
+        explicit RelationPrescanHandler(OsmData& d) : db(d) {}
+
+        void relation(const osmium::Relation& r) {
+            const char* type = r.tags()["type"];
+            if (!type || std::strcmp(type, "boundary") != 0) return;
+            if (!r.tags()["admin_level"]) return;
+            for (const auto& m : r.members())
+                if (m.type() == osmium::item_type::way)
+                    db.needed_way_ids.insert(m.ref());
+        }
+    };
 
     // ============================================================
     //  PASS 1 HANDLER – Nodes only
@@ -231,7 +260,18 @@ namespace DES {
 
         void way(const osmium::Way& w) {
             ++stats.raw_way_count;
-            if (w.tags().empty()) return;
+            const bool needed_by_boundary = db.needed_way_ids.contains(w.id());
+
+            // Fast path: tagless way that's only useful as a boundary segment.
+            // Resolve coords and cache, then bail — no semantic output to emit.
+            if (w.tags().empty()) {
+                if (needed_by_boundary) {
+                    CoordSeq coords = resolve_coords(w.nodes());
+                    if (!coords.empty())
+                        db.way_geom_cache.insert(w.id(), std::move(coords));
+                }
+                return;
+            }
 
             auto tags = intern_tags(w.tags(), db.pool);
             const StringPool& pool = db.pool;
@@ -299,6 +339,11 @@ namespace DES {
             }
 
             // ── Cache geometry for boundary relations ─────────────
+            // A way tagged with e.g. boundary=administrative carries tags
+            // but is neither an area nor a line — make sure its coords
+            // are resolved if a boundary relation needs them.
+            if (needed_by_boundary) ensure_coords();
+
             // We cache ALL ways with coords so relation assembly is O(1).
             // Only store if coords were already resolved (avoid extra work).
             if (coords_resolved && !coords.empty())
@@ -342,6 +387,21 @@ namespace DES {
         db.points.reserve(500'000);
         db.lines.reserve(200'000);
         db.raw_relations.reserve(20'000);
+        db.needed_way_ids.reserve(50'000);
+
+        // ── Pass 0: Pre-scan relations to find boundary-way IDs ──
+        std::cout << "  Pass 0: pre-scanning boundary relations ...\n";
+        auto t0 = Clock::now();
+        {
+            osmium::io::Reader reader{ pbf_path, osmium::osm_entity_bits::relation };
+            RelationPrescanHandler h{ db };
+            osmium::apply(reader, h);
+            reader.close();
+        }
+        stats.prescan_ms           = elapsed_ms(t0);
+        stats.needed_way_ids_count = db.needed_way_ids.size();
+        std::cout << "    needed ways=" << db.needed_way_ids.size()
+                  << "  (" << stats.prescan_ms << " ms)\n";
 
         // ── Pass 1: Nodes ────────────────────────────────────────
         std::cout << "  Pass 1: reading nodes ...\n";
@@ -422,6 +482,7 @@ namespace DES {
         { NodeCache    tmp; std::swap(db.node_cache, tmp); }
         { WayGeomCache tmp; std::swap(db.way_geom_cache, tmp); }
         { std::vector<RawRelation> tmp; std::swap(db.raw_relations, tmp); }
+        { std::unordered_set<int64_t> tmp; std::swap(db.needed_way_ids, tmp); }
 
         stats.processing_ms = elapsed_ms(t0);
         stats.point_count = db.points.size();
@@ -474,6 +535,10 @@ namespace DES {
             emit("street", p.street_off);
             emit("housenumber", p.housenumber_off);
             emit("postcode", p.postcode_off);
+            emit("country", p.country_off);
+            emit("state",   p.state_off);
+            emit("city",    p.city_off);
+            emit("suburb",  p.suburb_off);
             for (const auto& t : p.extra_tags) {
                 std::string s;
                 if (!first) s += ',';
@@ -558,7 +623,7 @@ namespace DES {
     }
 
     static void print_stats(const Stats& s) {
-        double total_ms = s.pass1_ms + s.pass2_ms + s.processing_ms + s.storage_ms;
+        double total_ms = s.prescan_ms + s.pass1_ms + s.pass2_ms + s.processing_ms + s.storage_ms;
 
         std::cout << "\n"
             << "╔══════════════════════════════════════════════╗\n"
@@ -584,6 +649,7 @@ namespace DES {
             << "║    String pool   : " << fmt_mb(s.string_pool_bytes) << "\n"
             << "╠══════════════════════════════════════════════╣\n"
             << "║  TIMING                                       ║\n"
+            << "║    Pass 0 (prescan)  : " << s.prescan_ms << " ms  (needed ways=" << s.needed_way_ids_count << ")\n"
             << "║    Pass 1 (nodes)    : " << s.pass1_ms << " ms\n"
             << "║    Pass 2 (ways/rel) : " << s.pass2_ms << " ms\n"
             << "║    Processing        : " << s.processing_ms << " ms\n"
@@ -593,20 +659,41 @@ namespace DES {
     }
 
     void storage(const OsmData& db, Stats& stats, const std::string& out_dir) {
-        std::cout << "[3/3] Storage – writing JSON ...\n";
+        std::cout << "[3/3] Storage ...\n";
         auto t0 = Clock::now();
 
         std::string sep = out_dir;
         if (!sep.empty() && sep.back() != '/' && sep.back() != '\\') sep += '/';
 
-        write_points(db, sep + "points.json");
-        std::cout << "    written: " << sep << "points.json\n";
+        // ---- JSON (legacy, opt-in via Config::STORE_JSON) ----
+        if constexpr (Config::STORE_JSON) {
+            auto tj = Clock::now();
+            write_points(db, sep + "points.json");
+            std::cout << "    written: " << sep << "points.json\n";
 
-        write_lines(db, sep + "lines.json");
-        std::cout << "    written: " << sep << "lines.json\n";
+            write_lines(db, sep + "lines.json");
+            std::cout << "    written: " << sep << "lines.json\n";
 
-        write_admin(db, sep + "admin_areas.json");
-        std::cout << "    written: " << sep << "admin_areas.json\n";
+            write_admin(db, sep + "admin_areas.json");
+            std::cout << "    written: " << sep << "admin_areas.json\n";
+            std::cout << "    JSON   write took " << elapsed_ms(tj) << " ms\n";
+        } else {
+            std::cout << "    JSON   skipped (Config::STORE_JSON == false)\n";
+        }
+
+        // ---- Binary (preferred at load time, opt-in via Config::STORE_BIN) ----
+        if constexpr (Config::STORE_BIN) {
+            auto tb = Clock::now();
+            bin::write_points(db, sep + "points.bin");
+            std::cout << "    written: " << sep << "points.bin\n";
+            bin::write_lines (db, sep + "lines.bin");
+            std::cout << "    written: " << sep << "lines.bin\n";
+            bin::write_admin (db, sep + "admin_areas.bin");
+            std::cout << "    written: " << sep << "admin_areas.bin\n";
+            std::cout << "    binary write took " << elapsed_ms(tb) << " ms\n";
+        } else {
+            std::cout << "    Binary skipped (Config::STORE_BIN == false)\n";
+        }
 
         stats.storage_ms = elapsed_ms(t0);
         print_stats(stats);

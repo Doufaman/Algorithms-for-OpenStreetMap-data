@@ -84,6 +84,17 @@ void run(const std::string& data_dir, const std::string& web_dir, int port) {
         res.set_content(api.admin_geojson(bbox), "application/json");
     });
 
+    // ── Sheet 2 Task 3 + 4: reverse geocoder ──────────────
+    svr.Get("/api/reverse", [&](const httplib::Request& req, httplib::Response& res) {
+        double lat = 0, lon = 0;
+        int    zoom = 15;
+        if (req.has_param("lat"))  lat  = std::atof(req.get_param_value("lat").c_str());
+        if (req.has_param("lon"))  lon  = std::atof(req.get_param_value("lon").c_str());
+        if (req.has_param("zoom")) zoom = std::atoi(req.get_param_value("zoom").c_str());
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(api.reverse_geojson(lat, lon, zoom), "application/json");
+    });
+
     svr.Get("/api/stats", [&](const httplib::Request&, httplib::Response& res) {
         std::string body =
             "{\"points\":"  + std::to_string(api.point_count()) +

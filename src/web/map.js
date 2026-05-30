@@ -199,6 +199,111 @@ async function loadStats() {
     } catch(_) {}
 }
 
+// ── Reverse geocoder (Sheet 2 Task 3+4) ──────────────────────
+const reverseLayer = L.layerGroup().addTo(map);
+
+async function reverseLookup(lat, lon) {
+    const zoom = map.getZoom();
+    setStatus('Reverse-geocoding …');
+    try {
+        const r = await fetch(`${API}/api/reverse?lat=${lat}&lon=${lon}&zoom=${zoom}`)
+                          .then(r => r.json());
+        showReverseResult(r, [lat, lon]);
+    } catch (e) {
+        setStatus('Reverse lookup failed');
+    }
+}
+
+function showReverseResult(geo, clickLatLng) {
+    reverseLayer.clearLayers();
+
+    // Red pin at click point
+    const pin = L.circleMarker(clickLatLng, {
+        radius: 6, color: '#ff4060', weight: 2, fillColor: '#ff4060', fillOpacity: 0.9
+    });
+    pin.addTo(reverseLayer);
+
+    if (!geo.features || geo.features.length === 0) {
+        setStatus('No object found near the click');
+        return;
+    }
+
+    const f = geo.features[0];
+    const p = f.properties || {};
+    const kind = p.object_kind || 'unknown';
+
+    // Highlight the object on the map
+    const geomLayer = L.geoJSON(f, {
+        pointToLayer: (_, latlng) => L.circleMarker(latlng, {
+            radius: 8, color: '#4af0b0', weight: 3,
+            fillColor: '#4af0b0', fillOpacity: 0.85
+        }),
+        style: () => ({ color: '#4af0b0', weight: 3, fillOpacity: 0.15 })
+    });
+    geomLayer.addTo(reverseLayer);
+
+    // If we got a point geometry, draw a dashed connector
+    if (f.geometry.type === 'Point') {
+        const [olon, olat] = f.geometry.coordinates;
+        L.polyline([clickLatLng, [olat, olon]],
+                   { color: '#ff4060', weight: 1.5, dashArray: '4 4' })
+            .addTo(reverseLayer);
+    }
+
+    // Status & popup
+    const addr = [p.suburb, p.city, p.state, p.country]
+                    .filter(v => v && v.length).join(', ');
+    setStatus(`${kind.toUpperCase()}: ${p.name || '(no name)'} · ${addr}`);
+    showReverseInfo(p, f.geometry.type);
+}
+
+function showReverseInfo(p, geomType) {
+    const pop = document.getElementById('info-popup');
+    const con = document.getElementById('info-content');
+
+    // Object-level fields: only show non-empty rows (e.g. a city polygon
+    // has no housenumber, no need for a blank row).
+    const objectRows = [
+        ['object kind', p.object_kind],
+        ['name',        p.name],
+        ['id',          p.id],
+        ['admin level', p.admin_level],
+        ['type',        p.type],
+        ['street',      p.street],
+        ['housenumber', p.housenumber],
+        ['postcode',    p.postcode],
+        ['distance',    p.distance_m != null ? p.distance_m.toFixed(1) + ' m' : null],
+    ].filter(([k, v]) => v !== undefined && v !== null && v !== '' && v !== 'null');
+
+    // Admin chain: ALWAYS show all 4 tiers, even if empty. Missing values
+    // render as "—" so users know the data simply wasn't available.
+    const dash = '—';
+    const adminRows = [
+        ['suburb',      p.suburb  || dash],
+        ['city',        p.city    || dash],
+        ['state',       p.state   || dash],
+        ['country',     p.country || dash],
+    ];
+
+    const renderRow = ([k, v]) =>
+        `<div class="info-row">
+           <span class="info-key">${k}</span>
+           <span class="info-val">${v}</span>
+         </div>`;
+
+    con.innerHTML =
+        `<div class="info-type">REVERSE · ${geomType.toUpperCase()}</div>` +
+        objectRows.map(renderRow).join('') +
+        `<div class="info-row" style="opacity:0.5"><span class="info-key">——</span><span class="info-val">admin chain</span></div>` +
+        adminRows.map(renderRow).join('');
+    pop.classList.remove('hidden');
+}
+
+// Click anywhere on the map → reverse geocode at that point
+map.on('click', e => {
+    reverseLookup(e.latlng.lat, e.latlng.lng);
+});
+
 // ── Boot ─────────────────────────────────────────────────────
 (async () => {
     // Show loading overlay

@@ -1,5 +1,6 @@
 #include "api_handler.h"
 #include "httplib.h"
+#include "io/binary_io.h"
 
 #include <fstream>
 #include <sstream>
@@ -8,6 +9,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <chrono>
+#include <queue>
 
 // ============================================================
 //  Minimal pull-style JSON parser
@@ -108,6 +111,10 @@ void ApiHandler::load_points(const std::string& path) {
                     else if (tk == "street")      rec.street      = tv;
                     else if (tk == "housenumber") rec.housenumber = tv;
                     else if (tk == "postcode")    rec.postcode    = tv;
+                    else if (tk == "country")     rec.country     = tv;
+                    else if (tk == "state")       rec.state       = tv;
+                    else if (tk == "city")        rec.city        = tv;
+                    else if (tk == "suburb")      rec.suburb      = tv;
                 }
             } else {
                 // skip unknown value
@@ -260,12 +267,390 @@ void ApiHandler::load_admin(const std::string& path) {
 }
 
 // ── Constructor ───────────────────────────────────────────────
+// Prefer binary (fast). Fall back to JSON if .bin file missing.
 ApiHandler::ApiHandler(const std::string& data_dir) {
     std::string sep = data_dir;
     if (!sep.empty() && sep.back() != '/' && sep.back() != '\\') sep += '/';
-    load_points(sep + "points.json");
-    load_lines (sep + "lines.json");
-    load_admin (sep + "admin_areas.json");
+
+    auto load_one = [&](const char* bin_name, const char* json_name,
+                        auto&& bin_fn, auto&& json_fn) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (bin_fn(sep + bin_name)) {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+            std::cout << "    " << bin_name << " loaded in " << ms << " ms\n";
+        } else {
+            std::cout << "    " << bin_name << " missing, falling back to JSON\n";
+            json_fn(sep + json_name);
+        }
+    };
+
+    load_one("points.bin", "points.json",
+        [&](const std::string& p){ return bin::read_points(p, points_); },
+        [&](const std::string& p){ load_points(p); });
+    load_one("lines.bin", "lines.json",
+        [&](const std::string& p){ return bin::read_lines(p, lines_); },
+        [&](const std::string& p){ load_lines(p); });
+    load_one("admin_areas.bin", "admin_areas.json",
+        [&](const std::string& p){ return bin::read_admin(p, admins_); },
+        [&](const std::string& p){ load_admin(p); });
+
+    std::cout << "  Building spatial indices ...\n";
+    point_index_.build(points_);
+    admin_index_.build(admins_);
+    std::cout << "    point grid : " << point_index_.cells.size() << " cells\n"
+              << "    admin grid : " << admin_index_.cells.size() << " cells\n";
+}
+
+// ============================================================
+//  Spatial-index implementations
+// ============================================================
+
+#include <cmath>
+
+static double haversine_m(double lat1, double lon1, double lat2, double lon2) {
+    constexpr double R = 6371000.0;
+    constexpr double D2R = 3.14159265358979323846 / 180.0;
+    double dlat = (lat2 - lat1) * D2R;
+    double dlon = (lon2 - lon1) * D2R;
+    double a = std::sin(dlat/2)*std::sin(dlat/2)
+             + std::cos(lat1*D2R)*std::cos(lat2*D2R)
+             * std::sin(dlon/2)*std::sin(dlon/2);
+    return 2.0 * R * std::asin(std::sqrt(a));
+}
+
+// ---- PointGridIndex ----------------------------------------
+void PointGridIndex::build(const std::vector<PointRecord>& pts) {
+    if (pts.empty()) return;
+    min_lat = pts[0].lat; max_lat = pts[0].lat;
+    min_lon = pts[0].lon; max_lon = pts[0].lon;
+    for (const auto& p : pts) {
+        if (p.lat < min_lat) min_lat = p.lat;
+        if (p.lat > max_lat) max_lat = p.lat;
+        if (p.lon < min_lon) min_lon = p.lon;
+        if (p.lon > max_lon) max_lon = p.lon;
+    }
+    // Target ~100 points/cell
+    int target = std::max(1, (int)std::sqrt((double)pts.size() / 100.0));
+    n_lat = std::clamp(target, 8, 4096);
+    n_lon = std::clamp(target, 8, 4096);
+    lat_step = (max_lat - min_lat + 1e-9) / n_lat;
+    lon_step = (max_lon - min_lon + 1e-9) / n_lon;
+    cells.assign((size_t)n_lat * n_lon, {});
+    for (uint32_t i = 0; i < pts.size(); ++i) {
+        int la = cell_lat(pts[i].lat);
+        int lo = cell_lon(pts[i].lon);
+        cells[(size_t)la * n_lon + lo].push_back(i);
+    }
+}
+
+int PointGridIndex::cell_lat(double lat) const {
+    int s = (int)((lat - min_lat) / lat_step);
+    if (s < 0) return 0;
+    if (s >= n_lat) return n_lat - 1;
+    return s;
+}
+int PointGridIndex::cell_lon(double lon) const {
+    int s = (int)((lon - min_lon) / lon_step);
+    if (s < 0) return 0;
+    if (s >= n_lon) return n_lon - 1;
+    return s;
+}
+
+uint32_t PointGridIndex::nearest(const std::vector<PointRecord>& pts,
+                                 double lat, double lon,
+                                 double* out_dist_m) const {
+    if (cells.empty()) return UINT32_MAX;
+    int cx = cell_lat(lat), cy = cell_lon(lon);
+    uint32_t best = UINT32_MAX;
+    double   best_d = 1e30;
+
+    // Expanding ring search. At ring r the closest possible candidate is
+    // at distance r * min(cell_lat_m, cell_lon_m). Stop when this exceeds best.
+    double cell_lat_m = haversine_m(lat, lon, lat + lat_step, lon);
+    double cell_lon_m = haversine_m(lat, lon, lat, lon + lon_step);
+    double cell_min_m = std::min(cell_lat_m, cell_lon_m);
+
+    for (int r = 0; ; ++r) {
+        int la0 = std::max(0, cx - r), la1 = std::min(n_lat - 1, cx + r);
+        int lo0 = std::max(0, cy - r), lo1 = std::min(n_lon - 1, cy + r);
+
+        // Only the ring cells (skip interior of previous rings).
+        for (int i = la0; i <= la1; ++i) {
+            for (int j = lo0; j <= lo1; ++j) {
+                if (r > 0 && i != la0 && i != la1 && j != lo0 && j != lo1) continue;
+                for (uint32_t idx : cells[(size_t)i * n_lon + j]) {
+                    double d = haversine_m(lat, lon, pts[idx].lat, pts[idx].lon);
+                    if (d < best_d) { best_d = d; best = idx; }
+                }
+            }
+        }
+        // Termination: when next ring can't beat current best.
+        if (best != UINT32_MAX && (double)r * cell_min_m > best_d) break;
+        if (la0 == 0 && la1 == n_lat - 1 && lo0 == 0 && lo1 == n_lon - 1) break;
+    }
+    if (out_dist_m) *out_dist_m = (best == UINT32_MAX) ? -1.0 : best_d;
+    return best;
+}
+
+// ---- PointGridIndex::k_nearest -----------------------------
+// Same ring-expansion search but keeps a max-heap of size k.
+void PointGridIndex::k_nearest(const std::vector<PointRecord>& pts,
+                               double lat, double lon, size_t k,
+                               std::vector<std::pair<double, uint32_t>>& out) const {
+    out.clear();
+    if (cells.empty() || k == 0) return;
+    int cx = cell_lat(lat), cy = cell_lon(lon);
+    using Entry = std::pair<double, uint32_t>;          // (distance, idx)
+    std::priority_queue<Entry> heap;                    // max-heap by distance
+
+    double cell_lat_m = haversine_m(lat, lon, lat + lat_step, lon);
+    double cell_lon_m = haversine_m(lat, lon, lat, lon + lon_step);
+    double cell_min_m = std::min(cell_lat_m, cell_lon_m);
+
+    for (int r = 0; ; ++r) {
+        int la0 = std::max(0, cx - r), la1 = std::min(n_lat - 1, cx + r);
+        int lo0 = std::max(0, cy - r), lo1 = std::min(n_lon - 1, cy + r);
+
+        for (int i = la0; i <= la1; ++i) {
+            for (int j = lo0; j <= lo1; ++j) {
+                if (r > 0 && i != la0 && i != la1 && j != lo0 && j != lo1) continue;
+                for (uint32_t idx : cells[(size_t)i * n_lon + j]) {
+                    double d = haversine_m(lat, lon, pts[idx].lat, pts[idx].lon);
+                    if (heap.size() < k)        heap.push({d, idx});
+                    else if (d < heap.top().first) { heap.pop(); heap.push({d, idx}); }
+                }
+            }
+        }
+        if (heap.size() == k && (double)r * cell_min_m > heap.top().first) break;
+        if (la0 == 0 && la1 == n_lat - 1 && lo0 == 0 && lo1 == n_lon - 1) break;
+    }
+
+    out.reserve(heap.size());
+    while (!heap.empty()) { out.push_back(heap.top()); heap.pop(); }
+    std::sort(out.begin(), out.end(),
+              [](const Entry& a, const Entry& b){ return a.first < b.first; });
+}
+
+// ---- AdminGridIndex ----------------------------------------
+void AdminGridIndex::build(const std::vector<AdminRecord>& ads) {
+    if (ads.empty()) return;
+    min_lat = ads[0].min_lat; max_lat = ads[0].max_lat;
+    min_lon = ads[0].min_lon; max_lon = ads[0].max_lon;
+    for (const auto& a : ads) {
+        if (a.min_lat < min_lat) min_lat = a.min_lat;
+        if (a.max_lat > max_lat) max_lat = a.max_lat;
+        if (a.min_lon < min_lon) min_lon = a.min_lon;
+        if (a.max_lon > max_lon) max_lon = a.max_lon;
+    }
+    int target = std::clamp((int)std::sqrt((double)ads.size()) * 2, 8, 256);
+    n_lat = target; n_lon = target;
+    lat_step = (max_lat - min_lat + 1e-9) / n_lat;
+    lon_step = (max_lon - min_lon + 1e-9) / n_lon;
+    cells.assign((size_t)n_lat * n_lon, {});
+    for (uint32_t i = 0; i < ads.size(); ++i) {
+        int la0 = std::clamp((int)((ads[i].min_lat - min_lat) / lat_step), 0, n_lat - 1);
+        int la1 = std::clamp((int)((ads[i].max_lat - min_lat) / lat_step), 0, n_lat - 1);
+        int lo0 = std::clamp((int)((ads[i].min_lon - min_lon) / lon_step), 0, n_lon - 1);
+        int lo1 = std::clamp((int)((ads[i].max_lon - min_lon) / lon_step), 0, n_lon - 1);
+        for (int la = la0; la <= la1; ++la)
+            for (int lo = lo0; lo <= lo1; ++lo)
+                cells[(size_t)la * n_lon + lo].push_back(i);
+    }
+}
+
+// Standard half-open ray casting on a ring stored as flat (lat, lon) pairs.
+static bool pip_ring(const std::vector<double>& ring, double lat, double lon) {
+    int crossings = 0;
+    size_t n = ring.size() / 2;
+    if (n < 3) return false;
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        double yi = ring[2*i], xi = ring[2*i + 1];
+        double yj = ring[2*j], xj = ring[2*j + 1];
+        bool ci = (yi > lat);
+        bool cj = (yj > lat);
+        if (ci == cj) continue;
+        double x_int = xi + (lat - yi) * (xj - xi) / (yj - yi);
+        if (x_int > lon) ++crossings;
+    }
+    return (crossings & 1) != 0;
+}
+
+uint32_t AdminGridIndex::pip_smallest(const std::vector<AdminRecord>& ads,
+                                      double lat, double lon, int admin_level) const {
+    if (cells.empty()) return UINT32_MAX;
+    int la = std::clamp((int)((lat - min_lat) / lat_step), 0, n_lat - 1);
+    int lo = std::clamp((int)((lon - min_lon) / lon_step), 0, n_lon - 1);
+    uint32_t best = UINT32_MAX;
+    double   best_area = 1e30;
+    for (uint32_t idx : cells[(size_t)la * n_lon + lo]) {
+        const auto& a = ads[idx];
+        if (admin_level >= 0 && a.admin_level != admin_level) continue;
+        if (lat < a.min_lat || lat > a.max_lat) continue;
+        if (lon < a.min_lon || lon > a.max_lon) continue;
+        if (!pip_ring(a.ring, lat, lon)) continue;
+        double area = (a.max_lat - a.min_lat) * (a.max_lon - a.min_lon); // rough proxy
+        if (area < best_area) { best_area = area; best = idx; }
+    }
+    return best;
+}
+
+// ============================================================
+//  Reverse geocoder
+// ============================================================
+//
+// Zoom-based dispatch:
+//   zoom ≥ 15 : nearest building (point)
+//   zoom 10-14: smallest admin containing point (typically city)
+//   zoom 7-9  : admin at level 4 (state)
+//   zoom < 7  : admin at level 2 (country)
+//
+// The returned GeoJSON always carries the FULL admin chain in properties
+// (country / state / city / suburb), no matter what object level was chosen.
+//
+// Forward declaration — esc() itself is defined further down with the
+// other GeoJSON helpers.
+static std::string esc(const std::string& s);
+
+static std::string field(const char* k, const std::string& v, bool& first) {
+    if (v.empty()) return {};
+    std::string s;
+    if (!first) s += ',';
+    s += '"'; s += k; s += "\":\"";
+    s += esc(v); s += '"';
+    first = false;
+    return s;
+}
+
+std::string ApiHandler::reverse_geojson(double lat, double lon, int zoom) const {
+    std::string out;
+    out.reserve(2048);
+    out += "{\"type\":\"FeatureCollection\",\"features\":[";
+
+    // Always look up nearest building so we can fill its admin chain
+    // even when the visible object is an admin polygon.
+    double dist_m = -1.0;
+    uint32_t nearest_idx = point_index_.nearest(points_, lat, lon, &dist_m);
+
+    // Pull admin chain from nearest building (preferred) or from PIP if no
+    // building was attached with chain info.
+    std::string country, state, city, suburb;
+    if (nearest_idx != UINT32_MAX) {
+        const auto& p = points_[nearest_idx];
+        country = p.country; state = p.state; city = p.city; suburb = p.suburb;
+    }
+
+    // Tier 1 fallback: PIP each admin level directly. Works when the
+    // admin polygon's outer ring is well-formed.
+    auto fill_from_admin = [&](int lvl, std::string& out_name) {
+        if (!out_name.empty()) return;
+        uint32_t idx = admin_index_.pip_smallest(admins_, lat, lon, lvl);
+        if (idx != UINT32_MAX) out_name = admins_[idx].name;
+    };
+    fill_from_admin(2,  country);
+    fill_from_admin(4,  state);
+    fill_from_admin(8,  city);
+    fill_from_admin(10, suburb);
+    if (suburb.empty()) fill_from_admin(9,  suburb);
+    if (suburb.empty()) fill_from_admin(11, suburb);
+
+    // Tier 2 fallback: vote among K nearest houses. Robust to broken
+    // admin polygons — nearby houses almost always share city/state/country.
+    if (country.empty() || state.empty() || city.empty() || suburb.empty()) {
+        std::vector<std::pair<double, uint32_t>> knn;
+        point_index_.k_nearest(points_, lat, lon, 20, knn);
+        for (const auto& [d, idx] : knn) {
+            const auto& p = points_[idx];
+            if (country.empty() && !p.country.empty()) country = p.country;
+            if (state.empty()   && !p.state.empty())   state   = p.state;
+            if (city.empty()    && !p.city.empty())    city    = p.city;
+            if (suburb.empty()  && !p.suburb.empty())  suburb  = p.suburb;
+            if (!country.empty() && !state.empty() &&
+                !city.empty()    && !suburb.empty())     break;
+        }
+    }
+
+    // Decide what object to return based on zoom
+    enum class Obj { House, City, State, Country };
+    Obj obj_kind;
+    if      (zoom >= 15) obj_kind = Obj::House;
+    else if (zoom >= 10) obj_kind = Obj::City;
+    else if (zoom >= 7 ) obj_kind = Obj::State;
+    else                 obj_kind = Obj::Country;
+
+    bool first_feat = true;
+    auto emit_admin_props = [&](std::string& s) {
+        bool f = true;
+        s += "\"country\":\""+esc(country)+"\""; (void)f; f = false;
+        s += ",\"state\":\""+esc(state)+"\"";
+        s += ",\"city\":\""+esc(city)+"\"";
+        s += ",\"suburb\":\""+esc(suburb)+"\"";
+    };
+
+    // House
+    if (obj_kind == Obj::House && nearest_idx != UINT32_MAX) {
+        const auto& p = points_[nearest_idx];
+        if (!first_feat) out += ',';
+        first_feat = false;
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\","
+                 "\"coordinates\":[%.7f,%.7f]},\"properties\":{",
+                 p.lon, p.lat);
+        out += buf;
+        out += "\"object_kind\":\"house\"";
+        out += ",\"id\":" + std::to_string(p.id);
+        out += ",\"admin_level\":null";
+        out += ",\"distance_m\":";
+        char db[32]; snprintf(db, sizeof(db), "%.2f", dist_m); out += db;
+        bool ff = false;
+        out += field("name",        p.name,        ff);
+        out += field("type",        p.type,        ff);
+        out += field("street",      p.street,      ff);
+        out += field("housenumber", p.housenumber, ff);
+        out += field("postcode",    p.postcode,    ff);
+        out += ",";
+        emit_admin_props(out);
+        out += "}}";
+    }
+    else {
+        // Admin polygon (city/state/country)
+        int want_level = (obj_kind == Obj::City) ? 8 :
+                         (obj_kind == Obj::State) ? 4 : 2;
+        uint32_t aidx = admin_index_.pip_smallest(admins_, lat, lon, want_level);
+        // Fall-back: any level if exact one missing
+        if (aidx == UINT32_MAX)
+            aidx = admin_index_.pip_smallest(admins_, lat, lon, -1);
+
+        if (aidx != UINT32_MAX) {
+            const auto& a = admins_[aidx];
+            if (!first_feat) out += ',';
+            first_feat = false;
+            out += "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Polygon\","
+                   "\"coordinates\":[[";
+            bool rfirst = true;
+            for (size_t i = 0; i + 1 < a.ring.size(); i += 2) {
+                if (!rfirst) out += ',';
+                rfirst = false;
+                char rb[64];
+                snprintf(rb, sizeof(rb), "[%.7f,%.7f]", a.ring[i+1], a.ring[i]);
+                out += rb;
+            }
+            out += "]]},\"properties\":{";
+            const char* okind = (obj_kind == Obj::City) ? "city" :
+                                (obj_kind == Obj::State) ? "state" : "country";
+            out += "\"object_kind\":\""; out += okind; out += "\"";
+            out += ",\"id\":" + std::to_string(a.id);
+            out += ",\"admin_level\":" + std::to_string(a.admin_level);
+            out += ",\"name\":\"" + esc(a.name) + "\"";
+            out += ",";
+            emit_admin_props(out);
+            out += "}}";
+        }
+    }
+
+    out += "]}";
+    return out;
 }
 
 // ============================================================

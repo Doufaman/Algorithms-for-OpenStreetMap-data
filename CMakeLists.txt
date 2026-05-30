@@ -14,6 +14,7 @@ endif()
 find_package(ZLIB    REQUIRED)
 find_package(BZip2   REQUIRED)
 find_package(Threads REQUIRED)
+find_package(OpenMP)   # optional – enables parallel slab build
 
 # ── Include paths ─────────────────────────────────────────────
 include_directories(
@@ -22,7 +23,9 @@ include_directories(
 )
 
 # ── Sources ───────────────────────────────────────────────────
-file(GLOB_RECURSE SOURCES "src/*.cpp")
+# CONFIGURE_DEPENDS makes CMake re-glob whenever build is invoked,
+# so newly-added .cpp files get picked up without manual cmake re-run.
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 
 # ── Executable ────────────────────────────────────────────────
 add_executable(OSM_Geocoder ${SOURCES})
@@ -42,3 +45,7 @@ target_link_libraries(OSM_Geocoder
     Threads::Threads
     expat
 )
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(OSM_Geocoder OpenMP::OpenMP_CXX)
+endif()
