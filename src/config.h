@@ -24,8 +24,7 @@ namespace Config {
 
     // ── Output toggles ────────────────────────────────────────
     // Set true to also write the legacy JSON files alongside binary.
-    // JSON is ~10× larger and ~3× slower to write; only enable when
-    // you need human-readable output for debugging.
+    // JSON is ~10× larger and ~3× slower to write; only enable when you need human-readable output for debugging.
     constexpr bool STORE_JSON = false;
     constexpr bool STORE_BIN  = true;
 
