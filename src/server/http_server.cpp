@@ -7,6 +7,8 @@
 #include <sstream>
 #include <cstdlib>
 #include <cstdio>
+#include <filesystem>
+#include <algorithm>
 
 namespace Server {
 
@@ -40,9 +42,72 @@ static int parse_limit(const httplib::Request& req, int def) {
     return std::atoi(req.get_param_value("limit").c_str());
 }
 
-void run(const std::string& data_dir, const std::string& web_dir, int port) {
-    std::cout << "Loading data from " << data_dir << " ...\n";
-    ApiHandler api(data_dir);
+// ------------------------------------------------------------
+//  Scan `data_root` for subdirectories that look like a parsed
+//  dataset (must contain at least points.bin).  Returns the list
+//  of dataset names, sorted alphabetically.
+// ------------------------------------------------------------
+static std::vector<std::string> list_datasets(const std::string& data_root) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (const auto& entry :
+             std::filesystem::directory_iterator(data_root, ec)) {
+        if (!entry.is_directory()) continue;
+        std::filesystem::path pts = entry.path() / "points.bin";
+        if (std::filesystem::exists(pts))
+            out.push_back(entry.path().filename().string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Minimal JSON-string escape (only what filenames may contain).
+static std::string json_esc(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if      (c == '"')  out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else                out += c;
+    }
+    return out;
+}
+
+void run(const std::string& data_root, const std::string& dataset,
+        const std::string& web_dir,   int port) {
+    std::string root = data_root;
+    if (!root.empty() && root.back() != '/' && root.back() != '\\')
+        root += '/';
+
+    // Resolve the dataset argument into one or more directories:
+    //   "all"        → every dataset subdir on disk
+    //   "a,b,c"      → the named subdirs
+    //   "<name>"     → that single subdir
+    std::vector<std::string> dirs;
+    std::string display_name = dataset;
+    if (dataset == "all") {
+        auto names = list_datasets(data_root);
+        for (const auto& n : names) dirs.push_back(root + n + "/");
+        display_name = "all (" + std::to_string(names.size()) + " datasets)";
+        std::cout << "Loading ALL datasets (" << names.size() << "):\n";
+        for (const auto& n : names) std::cout << "  • " << n << "\n";
+    } else if (dataset.find(',') != std::string::npos) {
+        size_t pos = 0;
+        std::string rest = dataset;
+        while (!rest.empty()) {
+            size_t comma = rest.find(',');
+            std::string name = rest.substr(0, comma);
+            if (!name.empty()) dirs.push_back(root + name + "/");
+            if (comma == std::string::npos) break;
+            rest.erase(0, comma + 1);
+        }
+        std::cout << "Loading " << dirs.size() << " selected datasets\n";
+    } else {
+        dirs.push_back(root + dataset + "/");
+        std::cout << "Loading data from " << dirs[0] << " ...\n";
+    }
+
+    ApiHandler api(dirs);
     std::cout << "  points="    << api.point_count()
               << "  lines="     << api.line_count()
               << "  admin="     << api.admin_count() << "\n";
@@ -95,11 +160,43 @@ void run(const std::string& data_dir, const std::string& web_dir, int port) {
         res.set_content(api.reverse_geojson(lat, lon, zoom), "application/json");
     });
 
+    // ── Sheet 3 Task 2: forward geocoder (search) ─────────
+    svr.Get("/api/search", [&](const httplib::Request& req, httplib::Response& res) {
+        std::string q     = req.has_param("q")     ? req.get_param_value("q")     : "";
+        int         limit = req.has_param("limit") ? std::atoi(req.get_param_value("limit").c_str()) : 20;
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(api.search_geojson(q, limit), "application/json");
+    });
+
     svr.Get("/api/stats", [&](const httplib::Request&, httplib::Response& res) {
         std::string body =
             "{\"points\":"  + std::to_string(api.point_count()) +
             ",\"lines\":"   + std::to_string(api.line_count())  +
             ",\"admin\":"   + std::to_string(api.admin_count()) + "}";
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(body, "application/json");
+    });
+
+    // ── Multi-dataset: which one am I serving? ────────────
+    svr.Get("/api/info", [&, display_name](const httplib::Request&, httplib::Response& res) {
+        std::string body =
+            "{\"dataset\":\"" + json_esc(display_name) + "\""
+            ",\"points\":"    + std::to_string(api.point_count()) +
+            ",\"lines\":"     + std::to_string(api.line_count())  +
+            ",\"admin\":"     + std::to_string(api.admin_count()) + "}";
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(body, "application/json");
+    });
+
+    // ── Multi-dataset: what else is on disk? ──────────────
+    svr.Get("/api/datasets", [&, data_root](const httplib::Request&, httplib::Response& res) {
+        auto names = list_datasets(data_root);
+        std::string body = "{\"current\":\"" + json_esc(dataset) + "\",\"available\":[";
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (i) body += ",";
+            body += "\"" + json_esc(names[i]) + "\"";
+        }
+        body += "]}";
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_content(body, "application/json");
     });

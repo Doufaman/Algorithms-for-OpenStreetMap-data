@@ -1,6 +1,9 @@
 #include "api_handler.h"
 #include "httplib.h"
 #include "io/binary_io.h"
+#include "geocoder/inverted_index.h"
+#include "geocoder/normalizer.h"
+#include "geocoder/geocoder.h"
 
 #include <fstream>
 #include <sstream>
@@ -266,41 +269,94 @@ void ApiHandler::load_admin(const std::string& path) {
     std::cout << "  Loaded " << admins_.size() << " admin areas\n";
 }
 
-// ── Constructor ───────────────────────────────────────────────
-// Prefer binary (fast). Fall back to JSON if .bin file missing.
-ApiHandler::ApiHandler(const std::string& data_dir) {
-    std::string sep = data_dir;
-    if (!sep.empty() && sep.back() != '/' && sep.back() != '\\') sep += '/';
+// ── Constructors ──────────────────────────────────────────────
+// Single-dir ctor delegates to the multi-dir one.
+ApiHandler::ApiHandler(const std::string& data_dir)
+    : ApiHandler(std::vector<std::string>{ data_dir }) {}
 
-    auto load_one = [&](const char* bin_name, const char* json_name,
-                        auto&& bin_fn, auto&& json_fn) {
+// Multi-dataset ctor: loads every directory in order, appending records
+// into the shared pools. bin::read_* clears its output vector, so each
+// artifact is read into a temp and then appended.
+ApiHandler::ApiHandler(const std::vector<std::string>& data_dirs) {
+    for (const auto& dir : data_dirs) {
+        std::string sep = dir;
+        if (!sep.empty() && sep.back() != '/' && sep.back() != '\\') sep += '/';
+        std::cout << "  Loading dataset dir: " << sep << "\n";
+
         auto t0 = std::chrono::steady_clock::now();
-        if (bin_fn(sep + bin_name)) {
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - t0).count();
-            std::cout << "    " << bin_name << " loaded in " << ms << " ms\n";
-        } else {
-            std::cout << "    " << bin_name << " missing, falling back to JSON\n";
-            json_fn(sep + json_name);
-        }
-    };
 
-    load_one("points.bin", "points.json",
-        [&](const std::string& p){ return bin::read_points(p, points_); },
-        [&](const std::string& p){ load_points(p); });
-    load_one("lines.bin", "lines.json",
-        [&](const std::string& p){ return bin::read_lines(p, lines_); },
-        [&](const std::string& p){ load_lines(p); });
-    load_one("admin_areas.bin", "admin_areas.json",
-        [&](const std::string& p){ return bin::read_admin(p, admins_); },
-        [&](const std::string& p){ load_admin(p); });
+        // ---- points ----
+        {
+            std::vector<PointRecord> tmp;
+            if (bin::read_points(sep + "points.bin", tmp)) {
+                points_.insert(points_.end(),
+                               std::make_move_iterator(tmp.begin()),
+                               std::make_move_iterator(tmp.end()));
+            } else {
+                std::cout << "    points.bin missing, falling back to JSON\n";
+                load_points(sep + "points.json");   // appends directly
+            }
+        }
+        // ---- lines ----
+        {
+            std::vector<LineRecord> tmp;
+            if (bin::read_lines(sep + "lines.bin", tmp)) {
+                lines_.insert(lines_.end(),
+                              std::make_move_iterator(tmp.begin()),
+                              std::make_move_iterator(tmp.end()));
+            } else {
+                std::cout << "    lines.bin missing, falling back to JSON\n";
+                load_lines(sep + "lines.json");
+            }
+        }
+        // ---- admins ----
+        {
+            std::vector<AdminRecord> tmp;
+            if (bin::read_admin(sep + "admin_areas.bin", tmp)) {
+                admins_.insert(admins_.end(),
+                               std::make_move_iterator(tmp.begin()),
+                               std::make_move_iterator(tmp.end()));
+            } else {
+                std::cout << "    admin_areas.bin missing, falling back to JSON\n";
+                load_admin(sep + "admin_areas.json");
+            }
+        }
+
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        std::cout << "    dir done in " << ms << " ms  (cumulative: "
+                  << points_.size() << " points, "
+                  << lines_.size()  << " lines, "
+                  << admins_.size() << " admins)\n";
+    }
 
     std::cout << "  Building spatial indices ...\n";
     point_index_.build(points_);
     admin_index_.build(admins_);
     std::cout << "    point grid : " << point_index_.cells.size() << " cells\n"
               << "    admin grid : " << admin_index_.cells.size() << " cells\n";
+
+    // ── Sheet 3 Task 2: inverted-index geocoder ────────────
+    std::cout << "  Building inverted index (Sheet 3 Task 2) ...\n";
+    auto ti0 = std::chrono::steady_clock::now();
+    geoc_index_ = std::make_unique<geocoder::InvertedIndex>();
+    geoc_index_->build(points_, lines_, admins_);
+    auto ti_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - ti0).count();
+    std::cout << "    unique tokens : " << geoc_index_->token_count()
+              << "   entries : "        << geoc_index_->total_entries()
+              << "   BK-tree : "        << geoc_index_->bktree().size()
+              << "   (" << ti_ms << " ms)\n";
+
+    // ── Sheet 3 Task 3: query orchestrator (ranker + splitter) ──
+    geocoder_ = std::make_unique<geocoder::Geocoder>(
+                    *geoc_index_, points_, lines_, admins_, point_index_);
+    std::cout << "  Geocoder orchestrator ready (Sheet 3 Task 3)\n";
 }
+
+// Out-of-line destructor so unique_ptr<InvertedIndex> can call the
+// full destructor (definition seen only via inverted_index.h include).
+ApiHandler::~ApiHandler() = default;
 
 // ============================================================
 //  Spatial-index implementations
@@ -763,6 +819,129 @@ std::string ApiHandler::admin_geojson(const BBox& bbox) const {
         out += "}}";
     }
     out += "]}";
+    return out;
+}
+
+// ============================================================
+//  Sheet 3 Task 2 — Forward geocoder via inverted index.
+//
+//  Query flow (Task 2 minimum — no smart splitting yet):
+//    1. tokenize the query using the DIN normalizer (Task 1)
+//    2. look up the intersection of all tokens in the inverted index
+//    3. build a GeoJSON feature for each hit, up to `limit`
+//
+//  Object → geometry mapping:
+//    POI    → Point
+//    Street → LineString (using its coord list)
+//    Admin  → Polygon    (using its ring)
+// ============================================================
+std::string ApiHandler::search_geojson(const std::string& q, int limit) const {
+    // Timing for /api/stats — Sheet 3 Task 4
+    auto t_start = std::chrono::steady_clock::now();
+
+    std::string out;
+    out.reserve(4096);
+    out += "{\"type\":\"FeatureCollection\",\"query\":\"" + esc(q) + "\",\"features\":[";
+
+    if (!geocoder_) { out += "]}"; return out; }
+    if (limit <= 0) limit = 20;
+
+    // Sheet 3 Task 3: use the orchestrator (ranker + split enumeration
+    // + housenumber refinement).  Returns Scored records already sorted
+    // by descending score.
+    auto scored = geocoder_->search(q, limit);
+
+    bool first = true;
+    for (const auto& sc : scored) {
+        const auto& r = sc.ref;
+        if (!first) out += ',';
+        first = false;
+
+        switch (r.kind) {
+        case geocoder::ObjectKind::POI: {
+            if (r.id >= points_.size()) continue;
+            const auto& p = points_[r.id];
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                     "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\","
+                     "\"coordinates\":[%.7f,%.7f]},\"properties\":{",
+                     p.lon, p.lat);
+            out += buf;
+            out += "\"kind\":\"poi\",\"id\":" + std::to_string(p.id);
+            if (!p.name.empty())    out += ",\"name\":\""    + esc(p.name)    + "\"";
+            if (!p.type.empty())    out += ",\"type\":\""    + esc(p.type)    + "\"";
+            if (!p.street.empty())      out += ",\"street\":\""      + esc(p.street)      + "\"";
+            if (!p.housenumber.empty()) out += ",\"housenumber\":\"" + esc(p.housenumber) + "\"";
+            if (!p.city.empty())    out += ",\"city\":\""    + esc(p.city)    + "\"";
+            if (!p.state.empty())   out += ",\"state\":\""   + esc(p.state)   + "\"";
+            if (!p.country.empty()) out += ",\"country\":\"" + esc(p.country) + "\"";
+            char sb[96];
+            snprintf(sb, sizeof(sb), ",\"score\":%.2f,\"matched\":%d",
+                     sc.score, sc.matched_tokens);
+            out += sb;
+            if (!sc.reason.empty()) out += ",\"reason\":\"" + esc(sc.reason) + "\"";
+            out += "}}";
+            break;
+        }
+        case geocoder::ObjectKind::Street: {
+            if (r.id >= lines_.size()) continue;
+            const auto& l = lines_[r.id];
+            out += "{\"type\":\"Feature\",\"geometry\":{\"type\":\"LineString\","
+                   "\"coordinates\":[";
+            bool cf = true;
+            for (size_t i = 0; i + 1 < l.coords.size(); i += 2) {
+                if (!cf) out += ',';
+                cf = false;
+                char cb[64];
+                snprintf(cb, sizeof(cb), "[%.7f,%.7f]", l.coords[i+1], l.coords[i]);
+                out += cb;
+            }
+            out += "]},\"properties\":{\"kind\":\"street\",\"id\":" + std::to_string(l.id);
+            if (!l.name.empty()) out += ",\"name\":\"" + esc(l.name) + "\"";
+            if (!l.type.empty()) out += ",\"type\":\"" + esc(l.type) + "\"";
+            char sb[96];
+            snprintf(sb, sizeof(sb), ",\"score\":%.2f,\"matched\":%d",
+                     sc.score, sc.matched_tokens);
+            out += sb;
+            if (!sc.reason.empty()) out += ",\"reason\":\"" + esc(sc.reason) + "\"";
+            out += "}}";
+            break;
+        }
+        case geocoder::ObjectKind::Admin: {
+            if (r.id >= admins_.size()) continue;
+            const auto& a = admins_[r.id];
+            out += "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Polygon\","
+                   "\"coordinates\":[[";
+            bool rf = true;
+            for (size_t i = 0; i + 1 < a.ring.size(); i += 2) {
+                if (!rf) out += ',';
+                rf = false;
+                char cb[64];
+                snprintf(cb, sizeof(cb), "[%.7f,%.7f]", a.ring[i+1], a.ring[i]);
+                out += cb;
+            }
+            out += "]]},\"properties\":{\"kind\":\"admin\",\"id\":" + std::to_string(a.id);
+            out += ",\"admin_level\":" + std::to_string(a.admin_level);
+            if (!a.name.empty()) out += ",\"name\":\"" + esc(a.name) + "\"";
+            char sb[96];
+            snprintf(sb, sizeof(sb), ",\"score\":%.2f,\"matched\":%d",
+                     sc.score, sc.matched_tokens);
+            out += sb;
+            if (!sc.reason.empty()) out += ",\"reason\":\"" + esc(sc.reason) + "\"";
+            out += "}}";
+            break;
+        }
+        }
+    }
+
+    // Sheet 3 Task 4: expose query time in ms for the frontend / grader.
+    auto t_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_start).count() / 1000.0;
+    char tail[128];
+    snprintf(tail, sizeof(tail),
+             "],\"returned\":%zu,\"query_ms\":%.2f}",
+             scored.size(), t_ms);
+    out += tail;
     return out;
 }
 

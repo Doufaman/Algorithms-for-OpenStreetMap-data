@@ -199,6 +199,69 @@ async function loadStats() {
     } catch(_) {}
 }
 
+// ── Multi-dataset: current name + available list ─────────────
+async function loadDatasetInfo() {
+    try {
+        const info = await fetch(`${API}/api/info`).then(r => r.json());
+        document.getElementById('dataset-val').textContent = info.dataset || '—';
+        document.title = `OSM Geocoder · ${info.dataset}`;
+    } catch(_) {}
+    try {
+        const d = await fetch(`${API}/api/datasets`).then(r => r.json());
+        renderDatasetMenu(d.current, d.available || []);
+    } catch(_) {}
+}
+
+function renderDatasetMenu(current, available) {
+    const menu = document.getElementById('dataset-menu');
+    if (!available.length) {
+        menu.innerHTML =
+            '<div class="dataset-menu-hint">No datasets on disk</div>';
+        return;
+    }
+
+    // "all" pseudo-entry on top, then each individual dataset.
+    const isAllCurrent = (current === 'all');
+    const entries =
+        [{ name: 'all', label: `all  (${available.length} datasets merged)`,
+           current: isAllCurrent }]
+        .concat(available.map(name => ({
+            name, label: name, current: !isAllCurrent && name === current,
+        })));
+
+    menu.innerHTML =
+        entries.map(e => {
+            const cls = e.current ? 'current' : 'other';
+            return `<div class="dataset-menu-item ${cls}" data-name="${e.name}">${e.label}</div>`;
+        }).join('') +
+        `<div class="dataset-menu-hint">
+           To switch: restart with<br/>
+           <code>./OSM_Geocoder serve &lt;name|all&gt;</code><br/>
+           (click an entry to copy its command)
+         </div>`;
+
+    // Click on a non-current item copies the restart command to clipboard
+    menu.querySelectorAll('.dataset-menu-item.other').forEach(el => {
+        el.addEventListener('click', ev => {
+            ev.stopPropagation();
+            const cmd = `./OSM_Geocoder serve ${el.dataset.name}`;
+            navigator.clipboard && navigator.clipboard.writeText(cmd);
+            const orig = el.textContent;
+            el.textContent = '✓ command copied';
+            setTimeout(() => el.textContent = orig, 1200);
+        });
+    });
+}
+
+// Dropdown toggle
+document.getElementById('dataset-chip').addEventListener('click', ev => {
+    ev.stopPropagation();
+    document.getElementById('dataset-menu').classList.toggle('hidden');
+});
+document.addEventListener('click', () => {
+    document.getElementById('dataset-menu').classList.add('hidden');
+});
+
 // ── Reverse geocoder (Sheet 2 Task 3+4) ──────────────────────
 const reverseLayer = L.layerGroup().addTo(map);
 
@@ -304,6 +367,178 @@ map.on('click', e => {
     reverseLookup(e.latlng.lat, e.latlng.lng);
 });
 
+// ── Forward geocoder (Sheet 3 Task 2) ────────────────────────
+const searchLayer    = L.layerGroup().addTo(map);
+const highlightLayer = L.layerGroup().addTo(map);   // overlay for selected result
+
+// Persistent state — features returned by the last search + which
+// one is currently highlighted.
+const searchState = { feats: [], selected: -1 };
+
+async function runSearch() {
+    const q = document.getElementById('search-input').value.trim();
+    if (!q) return;
+    const panel = document.getElementById('search-panel');
+    const list  = document.getElementById('search-list');
+    const summary = document.getElementById('search-summary');
+    summary.textContent = 'Searching …';
+    list.innerHTML = '';
+    panel.classList.remove('hidden');
+
+    // Clear anything left over from a previous reverse-geocode click.
+    // The reverse result is stale as soon as the user asks something new.
+    reverseLayer.clearLayers();
+    document.getElementById('info-popup').classList.add('hidden');
+
+    try {
+        const r = await fetch(`${API}/api/search?q=${encodeURIComponent(q)}&limit=20`)
+                        .then(r => r.json());
+        renderSearchResults(r);
+    } catch(e) {
+        summary.textContent = 'Search failed';
+    }
+}
+
+function renderSearchResults(gj) {
+    const list    = document.getElementById('search-list');
+    const summary = document.getElementById('search-summary');
+    searchLayer.clearLayers();
+    highlightLayer.clearLayers();
+    list.innerHTML = '';
+    searchState.feats    = [];
+    searchState.selected = -1;
+
+    const feats = gj.features || [];
+    const total = gj.returned != null ? gj.returned : feats.length;
+    const t = gj.query_ms != null ? ` · ${gj.query_ms.toFixed(1)} ms` : '';
+    summary.textContent = `${feats.length} results${t}`;
+
+    if (!feats.length) {
+        list.innerHTML = '<li style="color:var(--text-dim);text-align:center">No matches</li>';
+        return;
+    }
+
+    // Populate the sidebar only — the map layer is drawn lazily by
+    // selectResult() for the currently focused item ONLY.  This avoids
+    // painting 20 overlapping circles that look like "leftover highlights".
+    feats.forEach((f, i) => {
+        const p = f.properties || {};
+        const kind = p.kind || 'unknown';
+
+        const li = document.createElement('li');
+        const addr = [p.city, p.state, p.country].filter(v => v && v.length).join(', ');
+        const streetLine = p.street
+            ? `${p.street}${p.housenumber ? ' ' + p.housenumber : ''}`
+            : '';
+        const badge = (p.score != null)
+            ? `<span class="result-score">${p.score.toFixed(0)}</span>`
+            : '';
+        li.innerHTML =
+            `<div class="result-kind">
+               ${kind.toUpperCase()}${p.admin_level ? ' L'+p.admin_level : ''}
+               ${badge}
+             </div>` +
+            `<div class="result-name">${p.name || streetLine || '(no name)'}</div>` +
+            (streetLine && p.name ? `<div class="result-meta">${streetLine}</div>` : '') +
+            (addr ? `<div class="result-meta">${addr}</div>` : '') +
+            (p.reason ? `<div class="result-reason">${p.reason}</div>` : '');
+        li.onclick = () => selectResult(i);
+        list.appendChild(li);
+        searchState.feats.push(f);
+    });
+
+    // Auto-select the first result (draws it + focuses map on it).
+    if (feats.length) selectResult(0);
+}
+
+// ── Selection: exactly one result is rendered on the map at a time ──
+//
+// Anything previously on searchLayer / highlightLayer is wiped, then
+// the newly-selected feature is drawn in two layers:
+//   • a kind-coloured base (green/orange/blue)
+//   • a bright-red overlay so it stands out from the base tile POIs
+//
+function selectResult(idx) {
+    if (idx < 0 || idx >= searchState.feats.length) return;
+    searchState.selected = idx;
+
+    // Sidebar active state
+    document.querySelectorAll('#search-list li').forEach((el, i) => {
+        el.classList.toggle('active', i === idx);
+    });
+
+    // ── Wipe previous graphics — this is what fixes "residual highlight" ──
+    searchLayer.clearLayers();
+    highlightLayer.clearLayers();
+
+    const f = searchState.feats[idx];
+    const p = f.properties || {};
+    const kind = p.kind || 'unknown';
+    const geomType = f.geometry && f.geometry.type;
+
+    // Per-kind base styling
+    const kindStyle = {
+        poi   : { color:'#4af0b0', fillColor:'#4af0b0' },
+        street: { color:'#f0b44a' },
+        admin : { color:'#7a9ef0', fillColor:'#7a9ef0', fillOpacity:0.10, dashArray:'4 4' },
+    }[kind] || { color:'#e2e6f0' };
+
+    // ── Base (kind-coloured) drawing of the selected feature ──
+    L.geoJSON(f, {
+        style: () => ({ weight: 3, opacity: 0.9, fillOpacity: 0.15, ...kindStyle }),
+        pointToLayer: (_, latlng) => L.circleMarker(latlng, {
+            radius: 9, weight: 3, opacity: 1.0,
+            fillOpacity: 0.85, ...kindStyle
+        }),
+    }).addTo(searchLayer);
+
+    // ── Accented highlight overlay so it stands out from base POIs ──
+    if (geomType === 'Point') {
+        const [lon, lat] = f.geometry.coordinates;
+        L.circleMarker([lat, lon], {
+            radius: 16, weight: 3,
+            color: '#ff4060', fillColor: '#ff4060',
+            fillOpacity: 0.30, opacity: 1.0,
+        }).addTo(highlightLayer);
+    } else if (geomType === 'LineString') {
+        L.geoJSON(f, {
+            style: () => ({ color: '#ff4060', weight: 6, opacity: 1.0 })
+        }).addTo(highlightLayer);
+    } else if (geomType === 'Polygon' || geomType === 'MultiPolygon') {
+        L.geoJSON(f, {
+            style: () => ({
+                color: '#ff4060', weight: 4, opacity: 1.0, fill: false,
+            })
+        }).addTo(highlightLayer);
+    }
+
+    focusFeature(f);
+}
+
+function focusFeature(f) {
+    if (!f.geometry) return;
+    const g = f.geometry;
+    if (g.type === 'Point') {
+        const [lon, lat] = g.coordinates;
+        map.setView([lat, lon], Math.max(map.getZoom(), 17));
+    } else {
+        const bounds = L.geoJSON(f).getBounds();
+        if (bounds.isValid()) map.fitBounds(bounds, { padding: [40, 40] });
+    }
+}
+
+document.getElementById('search-btn').addEventListener('click', runSearch);
+document.getElementById('search-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') runSearch();
+});
+document.getElementById('search-close').addEventListener('click', () => {
+    document.getElementById('search-panel').classList.add('hidden');
+    searchLayer.clearLayers();
+    highlightLayer.clearLayers();
+    searchState.feats    = [];
+    searchState.selected = -1;
+});
+
 // ── Boot ─────────────────────────────────────────────────────
 (async () => {
     // Show loading overlay
@@ -313,6 +548,7 @@ map.on('click', e => {
     document.body.appendChild(overlay);
 
     await loadStats();
+    await loadDatasetInfo();
 
     // Fade out overlay
     overlay.classList.add('fade');

@@ -77,8 +77,8 @@ bool read_points(const std::string& path, std::vector<PointRecord>& out) {
     std::vector<char> strings(h.strings_size);
     if (h.strings_size) read_bytes(is, strings.data(), h.strings_size);
 
-    out.clear();
-    out.reserve(h.n_records);
+    // APPEND semantics: callers may merge several datasets into one vector.
+    out.reserve(out.size() + h.n_records);
     for (const auto& r : recs) {
         PointRecord pr;
         pr.id          = r.id;

@@ -34,6 +34,56 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg);
 
 .header-left { display: flex; align-items: center; gap: 10px; }
 
+/* Dataset selector chip in the header */
+.dataset-chip {
+  position: relative;
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 10px;
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer; user-select: none;
+  margin-left: 10px;
+  transition: border-color 0.15s;
+}
+.dataset-chip:hover { border-color: var(--c-accent); }
+.dataset-label {
+  font-family: var(--font-mono); font-size: 9px;
+  color: var(--text-dim); letter-spacing: 0.12em;
+}
+.dataset-val {
+  font-family: var(--font-mono); font-size: 12px; font-weight: 700;
+  color: var(--c-accent);
+}
+.dataset-arrow { color: var(--text-dim); font-size: 10px; }
+.dataset-menu {
+  position: absolute; top: calc(100% + 6px); left: 0;
+  min-width: 200px;
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  padding: 4px 0; z-index: 1200;
+}
+.dataset-menu.hidden { display: none; }
+.dataset-menu-item {
+  padding: 8px 12px;
+  font-family: var(--font-mono); font-size: 12px;
+  color: var(--text);
+  transition: background 0.1s;
+}
+.dataset-menu-item:hover { background: var(--bg3); }
+.dataset-menu-item.current {
+  color: var(--c-accent);
+}
+.dataset-menu-item.current::before { content: '● '; }
+.dataset-menu-item.other::before   { content: '○ '; color: var(--text-dim); }
+.dataset-menu-hint {
+  padding: 8px 12px;
+  font-family: var(--font-mono); font-size: 9px;
+  color: var(--text-dim); letter-spacing: 0.06em;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+}
+
 .logo-mark {
   font-size: 22px; color: var(--c-accent);
   animation: spin 8s linear infinite;
@@ -206,6 +256,96 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg);
   border: 2px solid var(--border);
   border-top-color: var(--c-accent);
   animation: spin 0.8s linear infinite;
+}
+
+/* ── Search box (Sheet 3 Task 2) ─────────────────────────── */
+.header-search {
+  display: flex; gap: 6px; flex: 1;
+  max-width: 480px; margin: 0 24px;
+}
+.header-search input {
+  flex: 1;
+  background: var(--bg3); border: 1px solid var(--border);
+  color: var(--text); border-radius: var(--radius);
+  padding: 6px 10px;
+  font-family: var(--font-body); font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.header-search input:focus { border-color: var(--c-accent); }
+.header-search input::placeholder { color: var(--text-dim); font-style: italic; }
+.header-search button {
+  background: var(--c-accent); color: #fff;
+  border: none; border-radius: var(--radius);
+  padding: 0 14px; font-family: var(--font-mono); font-size: 11px;
+  letter-spacing: 0.06em; cursor: pointer;
+  transition: filter 0.15s;
+}
+.header-search button:hover { filter: brightness(1.15); }
+
+#search-panel {
+  position: fixed; top: calc(var(--header-h) + 12px); left: 12px;
+  z-index: 1100;
+  width: 300px; max-height: calc(100vh - var(--header-h) - 60px);
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+#search-panel.hidden { display: none; }
+.search-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px;
+  background: var(--bg3); border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--text-dim); letter-spacing: 0.08em;
+}
+#search-close {
+  background: none; border: none; color: var(--text-dim);
+  cursor: pointer; font-size: 13px;
+}
+#search-close:hover { color: var(--text); }
+#search-list {
+  list-style: none; overflow-y: auto;
+  padding: 4px 0;
+}
+#search-list li {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+#search-list li:hover { background: var(--bg3); }
+#search-list li:last-child { border-bottom: none; }
+#search-list li.active {
+  background: linear-gradient(90deg,
+                rgba(224, 90, 122, 0.18) 0%,
+                rgba(224, 90, 122, 0.06) 100%);
+  border-left: 3px solid var(--c-accent);
+  padding-left: 11px;   /* keep text alignment despite the border */
+}
+#search-list li.active .result-kind { color: var(--c-accent); }
+.result-kind {
+  font-family: var(--font-mono); font-size: 9px;
+  color: var(--c-accent); letter-spacing: 0.10em;
+  margin-bottom: 2px;
+}
+.result-name  { font-size: 13px; color: var(--text); }
+.result-meta  { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+.result-reason{
+  font-family: var(--font-mono); font-size: 9px;
+  color: var(--text-dim); margin-top: 3px;
+  letter-spacing: 0.04em; opacity: 0.7;
+}
+.result-kind  {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.result-score {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 700;
+  background: var(--bg3); color: var(--c-point);
+  padding: 1px 6px; border-radius: 4px;
+  letter-spacing: 0;
 }
 
 /* ── Leaflet popup override ──────────────────────────────── */

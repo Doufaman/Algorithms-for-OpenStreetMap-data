@@ -16,7 +16,20 @@
   <div class="header-left">
     <span class="logo-mark">◈</span>
     <span class="logo-text">OSM<em>Geocoder</em></span>
+    <div class="dataset-chip" id="dataset-chip" title="Click to see other datasets">
+      <span class="dataset-label">DATASET</span>
+      <span class="dataset-val" id="dataset-val">—</span>
+      <span class="dataset-arrow">▾</span>
+      <div class="dataset-menu hidden" id="dataset-menu"></div>
+    </div>
   </div>
+
+  <!-- Sheet 3 Task 2 — forward search -->
+  <div class="header-search">
+    <input id="search-input" type="text" placeholder="e.g. Stuttgart Hauptbahnhof" autocomplete="off"/>
+    <button id="search-btn">Search</button>
+  </div>
+
   <div class="header-right">
     <div class="stat-chip" id="stat-points">
       <span class="stat-label">POINTS</span>
@@ -32,6 +45,15 @@
     </div>
   </div>
 </header>
+
+<!-- ── Search results side panel ───────────────── -->
+<div id="search-panel" class="hidden">
+  <div class="search-header">
+    <span id="search-summary">Results</span>
+    <button id="search-close">✕</button>
+  </div>
+  <ul id="search-list"></ul>
+</div>
 
 <!-- ── Map ────────────────────────────────────── -->
 <div id="map"></div>

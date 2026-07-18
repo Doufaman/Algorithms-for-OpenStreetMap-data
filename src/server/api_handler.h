@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <memory>
 
 struct BBox {
     double min_lon = -180, min_lat = -90;
@@ -85,9 +86,18 @@ struct AdminGridIndex {
                           double lat, double lon, int admin_level = -1) const;
 };
 
+// Forward declarations — full definitions in geocoder/*.h.
+// Held by pointer to avoid pulling the headers into every translation unit.
+namespace geocoder { class InvertedIndex; class Geocoder; }
+
 class ApiHandler {
 public:
     explicit ApiHandler(const std::string& data_dir);
+    // Multi-dataset constructor: loads every directory in order and
+    // merges points/lines/admins into one searchable pool. Spatial and
+    // text indices are built once over the merged data.
+    explicit ApiHandler(const std::vector<std::string>& data_dirs);
+    ~ApiHandler();                              // needed for unique_ptr<forward-decl>
 
     std::string points_geojson(const BBox& bbox, int limit) const;
     std::string lines_geojson (const BBox& bbox, int limit) const;
@@ -97,6 +107,11 @@ public:
     // returned object (house at high zoom → country at low zoom).
     // Always includes the full admin chain in the response.
     std::string reverse_geojson(double lat, double lon, int zoom) const;
+
+    // Sheet 3 Task 2: forward geocoder. Takes a free-form text query,
+    // tokenizes + normalizes it, queries the InvertedIndex, and returns
+    // matching objects as GeoJSON features (up to `limit`).
+    std::string search_geojson(const std::string& q, int limit) const;
 
     size_t point_count() const { return points_.size(); }
     size_t line_count()  const { return lines_.size();  }
@@ -109,6 +124,9 @@ private:
 
     PointGridIndex point_index_;
     AdminGridIndex admin_index_;
+
+    std::unique_ptr<geocoder::InvertedIndex> geoc_index_;
+    std::unique_ptr<geocoder::Geocoder>      geocoder_;
 
     void load_points(const std::string& path);
     void load_lines (const std::string& path);

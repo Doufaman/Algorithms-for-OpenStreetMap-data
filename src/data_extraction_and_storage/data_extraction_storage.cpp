@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cstdio>
 #include <iomanip>
+#include <unordered_map>
 
 #include <osmium/io/pbf_input.hpp>
 #include <osmium/handler.hpp>
@@ -439,6 +440,84 @@ namespace DES {
     }
 
     // ============================================================
+    //  Ring stitching (Sheet 3 followup — fixes Sheet 1 concat bug)
+    //
+    //  OSM multipolygon boundaries are stored as a list of way
+    //  members. Each way is an ordered coord sequence, but the
+    //  ways themselves are NOT in ring order — you have to stitch
+    //  them by matching endpoints (start / end coords).
+    //
+    //  Old code just concat'd in relation-member order, which drew
+    //  spurious edges through the interior and broke PIP + display.
+    //
+    //  Algorithm:
+    //    • pick each unused segment as a seed
+    //    • greedily extend: find a segment whose start OR end matches
+    //      the current ring's tail; append (or reverse-append)
+    //    • keep the longest ring produced across all seeds
+    //
+    //  Complexity per relation: O(N²) in segment count, but N is
+    //  typically < 20 so this is negligible.
+    // ============================================================
+    static CoordSeq stitch_ring(std::vector<const CoordSeq*> segments) {
+        // Filter out null / empty segments
+        segments.erase(std::remove_if(segments.begin(), segments.end(),
+                       [](const CoordSeq* s){ return !s || s->empty(); }),
+                       segments.end());
+        if (segments.empty()) return {};
+        if (segments.size() == 1) return *segments[0];
+
+        auto pack = [](std::pair<int32_t,int32_t> p) -> uint64_t {
+            return ((uint64_t)(uint32_t)p.first << 32) | (uint32_t)p.second;
+        };
+
+        CoordSeq best;
+
+        for (size_t seed = 0; seed < segments.size(); ++seed) {
+            std::vector<bool> used(segments.size(), false);
+            used[seed] = true;
+            CoordSeq ring = *segments[seed];
+            if (ring.empty()) continue;
+
+            // Greedy forward extension
+            bool extended = true;
+            while (extended) {
+                extended = false;
+                uint64_t tail = pack(ring.back());
+                for (size_t i = 0; i < segments.size(); ++i) {
+                    if (used[i]) continue;
+                    const CoordSeq& s = *segments[i];
+                    bool match_start = (pack(s.front()) == tail);
+                    bool match_end   = (pack(s.back())  == tail);
+                    if (!match_start && !match_end) continue;
+
+                    used[i] = true;
+                    if (match_start) {
+                        // Append skipping the first coord (== ring.back())
+                        ring.insert(ring.end(), s.begin() + 1, s.end());
+                    } else {
+                        // Reverse-append, skipping the last coord
+                        for (auto it = s.rbegin() + 1; it != s.rend(); ++it)
+                            ring.push_back(*it);
+                    }
+                    extended = true;
+                    break;
+                }
+            }
+
+            if (ring.size() > best.size()) best = std::move(ring);
+        }
+
+        // If stitching totally failed (shouldn't happen with good data),
+        // fall back to naive concat so we at least have a bbox.
+        if (best.empty()) {
+            for (const auto* s : segments)
+                best.insert(best.end(), s->begin(), s->end());
+        }
+        return best;
+    }
+
+    // ============================================================
     //  PROCESSING
     //  Assembles AdminAreas from buffered RawRelations using the
     //  WayGeomCache, then releases all temporary data.
@@ -448,6 +527,7 @@ namespace DES {
         auto t0 = Clock::now();
 
         StringPool& pool = db.pool;
+        size_t n_open_rings = 0;   // rings that didn't close cleanly
 
         for (const auto& rr : db.raw_relations) {
             const char* level = tag_value(rr.tags, pool, "admin_level");
@@ -460,19 +540,26 @@ namespace DES {
             const char* name = tag_value(rr.tags, pool, "name");
             if (name && *name) a.name_off = pool.intern(name);
 
-            // Assemble outer ring from member ways via O(1) cache lookup
+            // Collect segment pointers for outer role
+            std::vector<const CoordSeq*> segs;
+            segs.reserve(rr.members.size());
             for (const auto& m : rr.members) {
                 if (m.type != 'w') continue;
                 const char* role = pool.get(m.role_off);
                 if (std::strcmp(role, "outer") != 0 &&
                     std::strcmp(role, "") != 0) continue;
-
-                const CoordSeq* seg = db.way_geom_cache.find(m.ref);
-                if (!seg || seg->empty()) continue;
-                a.outer_ring.insert(a.outer_ring.end(), seg->begin(), seg->end());
+                segs.push_back(db.way_geom_cache.find(m.ref));
             }
 
+            // Stitch segments into a proper ring by endpoint matching
+            a.outer_ring = stitch_ring(std::move(segs));
+
             if (a.outer_ring.empty()) continue;
+
+            // Track ring quality
+            if (a.outer_ring.size() >= 2 &&
+                a.outer_ring.front() != a.outer_ring.back()) ++n_open_rings;
+
             build_bbox(a.outer_ring, a.min_lat_e7, a.max_lat_e7,
                 a.min_lon_e7, a.max_lon_e7);
             db.admin_areas.push_back(std::move(a));
@@ -496,6 +583,10 @@ namespace DES {
             << "  lines=" << stats.line_count
             << "  admin_areas=" << stats.admin_count
             << "  (" << stats.processing_ms << " ms)\n";
+        if (n_open_rings) {
+            std::cout << "    warning: " << n_open_rings
+                      << " admin ring(s) did not close cleanly\n";
+        }
     }
 
     // ============================================================
