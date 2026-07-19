@@ -32,26 +32,60 @@ Put the downloaded PBF file in the "data" folder. Then modify file paths in "con
 |-- config.h<br>
 
 ### 3. Run
-Run main.cpp and follow the instruction.<br>
-Data processing: 
 
-    wsl bash -c "cd '<your_path>/build' && ./OSM_Geocoder"
+All commands below are plain Linux commands (Ubuntu 22.04). If you work
+from Windows PowerShell with WSL, wrap each command as
+`wsl bash -c "cd '<your_path>' && <command>"`.
 
-Frontend: 
+#### 3.1 Build
 
-    ```
-    wsl bash -c "cd '<your_path>/build' && ./OSM_Geocoder serve"
-    ```
+    cd "<your_path>"
+    mkdir -p build && cd build
+    cmake ..
+    make -j
 
-### 4. Function
+The executable `OSM_Geocoder` is created in the `build` folder.
+New source files are picked up automatically on the next `make`
+(no need to re-run cmake).
 
+#### 3.2 Parse (data processing)
 
-## Further reading
+Parse the default PBF configured in `src/config.h`:
 
-- **Sheet 3 Task 3 — Ranking & natural-language interpretation**:
-  see [`geocoder_heuristics.md`](geocoder_heuristics.md) for the
-  weighted scoring formula, query-split algorithm, worked examples
-  (`Aalen Hauptstrasse 10`, `Oberer Grundweg Vaihingen`) and the
-  reasoning behind each design decision.
-- **Optional-task design proposal** (dual normalization + exonyms +
-  category synonyms): [`geocoder_features_design.md`](geocoder_features_design.md).
+    ./OSM_Geocoder
+
+Or parse any specific PBF file — a bare filename is resolved relative
+to the `data/` folder:
+
+    ./OSM_Geocoder bayern-260717.osm.pbf
+    ./OSM_Geocoder /absolute/path/to/some-region.osm.pbf
+
+Each parse writes its output to its own subfolder `data/<dataset>/`
+(binary files `points.bin`, `lines.bin`, `admin_areas.bin`), so
+different regions never overwrite each other. A timestamped benchmark
+report is saved to `data/benchmark/<dataset>_<time>.md`.
+
+To parse several regions in a row:
+
+    for f in bremen-260717.osm.pbf hamburg-260717.osm.pbf; do
+        ./OSM_Geocoder "$f"
+    done
+
+#### 3.3 Frontend (server)
+
+Serve the default dataset (see `DEFAULT_SERVE_DATASET` in `src/config.h`):
+
+    ./OSM_Geocoder serve
+
+Serve one specific dataset:
+
+    ./OSM_Geocoder serve bayern-260717
+
+Serve several datasets merged, or all parsed datasets at once:
+
+    ./OSM_Geocoder serve bremen-260717,hamburg-260717
+    ./OSM_Geocoder serve all
+
+Then open **http://localhost:8080** in a browser. The header shows the
+loaded dataset; the dropdown lists all datasets available on disk.
+Stop the server with `Ctrl+C`.
